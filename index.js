@@ -2002,14 +2002,23 @@ export function createProxyFetchHandler(client) {
       bridgeMaxQueue: config.bridgeMaxQueue,
       keepSessions: config.keepSessions,
     }
+    // Filled in by the streaming generators below so the completion log can
+    // flag suspicious empty responses (no text, no tool calls, no error).
+    const streamMeta = {}
     const streamCleanup = once(() => {
       releaseSlot()
       context.finish()
-      safeLog(client, "info", "Proxy stream completed", {
+      const meta = {
         method: request.method,
         path: url.pathname,
         durationMs: Date.now() - started,
-      })
+        ...streamMeta,
+      }
+      if (streamMeta.contentLength === 0 && streamMeta.toolCalls === 0 && !streamMeta.error) {
+        safeLog(client, "warn", "Proxy stream completed with empty response", meta)
+      } else {
+        safeLog(client, "info", "Proxy stream completed", meta)
+      }
     })
 
     try {
@@ -2122,6 +2131,9 @@ export function createProxyFetchHandler(client) {
             requestOptions,
           ), () => emitted)
             .then(({ result: streamResult, model: selectedModel }) => {
+              streamMeta.contentLength = streamResult.content?.length ?? 0
+              streamMeta.toolCalls = streamResult.toolCalls?.length ?? 0
+              streamMeta.finish = streamResult.finish ?? null
               model = selectedModel
               if (!emitted && streamResult.content && !(streamResult.toolCalls?.length > 0)) {
                 emitted = true
@@ -2340,10 +2352,13 @@ export function createProxyFetchHandler(client) {
             requestOptions,
           ), () => emitted)
             .then(({ result: streamResult, model: selectedModel }) => {
+              streamMeta.contentLength = streamResult.content?.length ?? 0
+              streamMeta.toolCalls = streamResult.toolCalls?.length ?? 0
+              streamMeta.finish = streamResult.finish ?? null
               model = selectedModel
               if (!emitted && streamResult.content && !(streamResult.toolCalls?.length > 0)) {
-                accumulatedText = streamResult.content
                 emitted = true
+                accumulatedText = streamResult.content
                 queue.enqueue(sseEvent("response.output_item.added", { type: "response.output_item.added", output_index: 0, item: { id: itemID, type: "message", status: "in_progress", role: "assistant", content: [] } }))
                 queue.enqueue(sseEvent("response.content_part.added", { type: "response.content_part.added", item_id: itemID, output_index: 0, content_index: 0, part: { type: "output_text", text: "", annotations: [] } }))
                 queue.enqueue(sseEvent("response.output_text.delta", { type: "response.output_text.delta", item_id: itemID, output_index: 0, content_index: 0, delta: accumulatedText }))
@@ -2620,6 +2635,9 @@ export function createProxyFetchHandler(client) {
             requestOptions,
           ), () => emitted)
             .then(({ result: streamResult, model: selectedModel }) => {
+              streamMeta.contentLength = streamResult.content?.length ?? 0
+              streamMeta.toolCalls = streamResult.toolCalls?.length ?? 0
+              streamMeta.finish = streamResult.finish ?? null
               model = selectedModel
               if (!emitted && streamResult.content && !(streamResult.toolCalls?.length > 0)) {
                 emitted = true
@@ -2784,6 +2802,9 @@ export function createProxyFetchHandler(client) {
             requestOptions,
           ), () => emitted)
             .then(({ result: streamResult }) => {
+              streamMeta.contentLength = streamResult.content?.length ?? 0
+              streamMeta.toolCalls = streamResult.toolCalls?.length ?? 0
+              streamMeta.finish = streamResult.finish ?? null
               if (!emitted && streamResult.content && !(streamResult.toolCalls?.length > 0)) {
                 emitted = true
                 queue.enqueue(JSON.stringify(createGeminiResponse(streamResult.content, null, null)) + "\n")
