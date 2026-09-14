@@ -30,6 +30,13 @@ const DEFAULTS = Object.freeze({
   bridgeMaxQueue: 32,
 })
 
+// How long the agent-turn event stream may stay silent before the proxy polls
+// the session state directly. Only relevant when OpenCode never emits
+// `session.idle` (observed for sessions driven through the plugin SDK), where
+// the subscription otherwise stays open forever and the request hangs until
+// the client times out.
+const STREAM_QUIET_POLL_MS = 500
+
 class ProxyError extends Error {
   constructor(message, status = 500, code = "server_error") {
     super(message)
@@ -1218,63 +1225,121 @@ async function runAgentTurn(client, model, messages, system, callerTools, onChun
         ...(options.variant ? { variant: options.variant } : {}),
       },
     })
-    for await (const event of stream) {
-      if (event.type === "message.part.delta") {
-        // Real incremental token deltas arrive here, as flat properties (sessionID,
-        // partID, field, delta) - NOT nested under event.properties.part like
-        // message.part.updated below. This is the actual live-streaming source; the
-        // fallback via session.messages() after the loop covers turns where OpenCode
-        // doesn't emit these (see below).
-        const props = event.properties
-        if (
-          props?.sessionID === sessionID &&
-          props?.field === "text" &&
-          typeof props.delta === "string" &&
-          props.delta.length > 0
-        ) {
-          content += props.delta
-          await onChunk?.(props.delta)
-        }
-      } else if (event.type === "message.part.updated") {
-        const part = event.properties?.part
-        if (!part || part.sessionID !== sessionID) continue
+    // OpenCode does not reliably emit `session.idle` for sessions driven
+    // through the plugin SDK (with some versions no events arrive on the
+    // subscription at all), so the event stream alone cannot be trusted to
+    // terminate a turn. Drive the iterator manually and, whenever the stream
+    // has been quiet for a moment, poll the session state and stop once the
+    // turn has finished.
+    const iterator = stream[Symbol.asyncIterator]()
+    let pending = iterator.next()
 
-        if (
-          toolIDSet &&
-          part.type === "tool" &&
-          toolIDSet.has(part.tool) &&
-          (!toolMessageID || part.messageID === toolMessageID)
-        ) {
-          // A bridge tool call. Input is empty on "pending" and only populated on
-          // "running"/"completed", so we keep updating until we have the arguments.
-          if (part.messageID) toolMessageID = part.messageID
-          recordToolPart(part)
-        } else if (
-          part.type === "step-finish" &&
-          toolCallsByID.size > 0 &&
-          (!toolMessageID || part.messageID === toolMessageID)
-        ) {
-          // The tool-calling step is complete: every tool call in this assistant
-          // message (including parallel ones) has now been observed with its arguments.
-          // Abort before OpenCode runs a follow-up step on the placeholder bridge
-          // results (which would waste tokens and could emit spurious calls).
-          try {
-            await client.session.abort({ path: { id: sessionID } })
-          } catch {
-            // Best effort - we're ending our own read loop regardless.
+    const turnFinished = async () => {
+      try {
+        if (typeof client.session?.status === "function") {
+          const result = await client.session.status({ signal: options.signal })
+          const status = result.data?.[sessionID]
+          if (status) return status.type === "idle"
+          // Session not tracked as busy: confirm via the messages below.
+        }
+      } catch {
+        // Fall through to the message-based check.
+      }
+      try {
+        const result = await client.session.messages({ path: { id: sessionID }, signal: options.signal })
+        const last = (result.data ?? []).filter((entry) => entry.info?.role === "assistant").at(-1)
+        const finish = last?.info?.finish
+        return Boolean(last?.info?.error || (finish && finish !== "tool-calls" && finish !== "tool_calls"))
+      } catch {
+        return false
+      }
+    }
+
+    try {
+      for (;;) {
+        const quiet = new Promise((resolve) => {
+          const timer = setTimeout(() => resolve(null), STREAM_QUIET_POLL_MS)
+          timer.unref?.()
+        })
+        const result = await Promise.race([pending, quiet])
+        if (result === null) {
+          // No event for a while: the turn may have finished without
+          // `session.idle`. Keep waiting unless OpenCode confirms completion.
+          if (await turnFinished()) break
+          continue
+        }
+        if (result.done) break
+        const event = result.value
+        pending = iterator.next()
+
+        if (event.type === "message.part.delta") {
+          // Real incremental token deltas arrive here, as flat properties (sessionID,
+          // partID, field, delta) - NOT nested under event.properties.part like
+          // message.part.updated below. This is the actual live-streaming source; the
+          // fallback via session.messages() after the loop covers turns where OpenCode
+          // doesn't emit these (see below).
+          const props = event.properties
+          if (
+            props?.sessionID === sessionID &&
+            props?.field === "text" &&
+            typeof props.delta === "string" &&
+            props.delta.length > 0
+          ) {
+            content += props.delta
+            await onChunk?.(props.delta)
+          }
+        } else if (event.type === "message.part.updated") {
+          const part = event.properties?.part
+          if (!part || part.sessionID !== sessionID) continue
+
+          if (
+            toolIDSet &&
+            part.type === "tool" &&
+            toolIDSet.has(part.tool) &&
+            (!toolMessageID || part.messageID === toolMessageID)
+          ) {
+            // A bridge tool call. Input is empty on "pending" and only populated on
+            // "running"/"completed", so we keep updating until we have the arguments.
+            if (part.messageID) toolMessageID = part.messageID
+            recordToolPart(part)
+          } else if (
+            part.type === "step-finish" &&
+            toolCallsByID.size > 0 &&
+            (!toolMessageID || part.messageID === toolMessageID)
+          ) {
+            // The tool-calling step is complete: every tool call in this assistant
+            // message (including parallel ones) has now been observed with its arguments.
+            // Abort before OpenCode runs a follow-up step on the placeholder bridge
+            // results (which would waste tokens and could emit spurious calls).
+            try {
+              await client.session.abort({ path: { id: sessionID } })
+            } catch {
+              // Best effort - we're ending our own read loop regardless.
+            }
+            break
+          }
+        } else if (event.type === "session.error") {
+          if (event.properties?.sessionID === sessionID) {
+            errorMessage = event.properties?.error?.message ?? "Model call failed."
           }
           break
-        }
-      } else if (event.type === "session.error") {
-        if (event.properties?.sessionID === sessionID) {
-          errorMessage = event.properties?.error?.message ?? "Model call failed."
-        }
-        break
-      } else if (event.type === "session.idle") {
-        if (event.properties?.sessionID === sessionID) {
-          break
+        } else if (event.type === "session.status") {
+          // Newer OpenCode emits session.status transitions; an idle status
+          // ends the turn even when `session.idle` itself is never emitted.
+          if (event.properties?.sessionID === sessionID && event.properties?.status?.type === "idle") {
+            break
+          }
+        } else if (event.type === "session.idle") {
+          if (event.properties?.sessionID === sessionID) {
+            break
+          }
         }
       }
+    } finally {
+      // The loop may exit with a read still outstanding; attach a noop
+      // rejection handler so an abort-induced rejection never surfaces as an
+      // unhandled rejection.
+      pending.catch(() => {})
     }
   } catch (error) {
     await deleteSession(client, sessionID, options.keepSessions)

@@ -537,6 +537,151 @@ test("stream: true propagates session.error into the SSE stream", async () => {
   assert.ok(text.includes("[DONE]"))
 })
 
+// Builds a streaming client whose event subscription delivers `chunks` and
+// then stays open forever without emitting anything else. This mirrors real
+// OpenCode sessions driven through the plugin SDK, where `session.idle` is
+// not reliably emitted and the subscription never closes on its own.
+function createSilentStreamClient(chunks) {
+  const client = createStreamingClient(chunks)
+  client.event.subscribe = async () => {
+    let index = 0
+    const stream = {
+      [Symbol.asyncIterator]() {
+        return this
+      },
+      async next() {
+        if (index < chunks.length) return { done: false, value: chunks[index++] }
+        return new Promise(() => {}) // never settles: the stream stays silently open
+      },
+      async return() {
+        return { done: true, value: undefined }
+      },
+    }
+    return { stream }
+  }
+  return client
+}
+
+test("stream completes when session.idle never arrives", async () => {
+  const client = createSilentStreamClient([
+    {
+      type: "message.part.delta",
+      properties: { sessionID: "sess-123", field: "text", delta: "Hello" },
+    },
+  ])
+
+  const handler = createProxyFetchHandler(client)
+  const request = new Request("http://127.0.0.1:4010/v1/chat/completions", {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({
+      model: "gpt-4o",
+      stream: true,
+      messages: [{ role: "user", content: "hi" }],
+    }),
+  })
+
+  const response = await handler(request)
+  assert.equal(response.status, 200)
+
+  const text = await response.text()
+  assert.ok(text.includes("Hello"))
+  assert.ok(text.includes("[DONE]"))
+})
+
+test("stream completes when no events arrive at all", async () => {
+  // The extreme case observed in the wild: the subscription delivers zero
+  // events for the session. The response must still complete (with the full
+  // content emitted once, via the not-emitted fallback) instead of hanging
+  // until the caller times out.
+  const client = createSilentStreamClient([])
+
+  const handler = createProxyFetchHandler(client)
+  const request = new Request("http://127.0.0.1:4010/v1/chat/completions", {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({
+      model: "gpt-4o",
+      stream: true,
+      messages: [{ role: "user", content: "hi" }],
+    }),
+  })
+
+  const response = await handler(request)
+  assert.equal(response.status, 200)
+
+  const text = await response.text()
+  assert.ok(text.includes("[DONE]"))
+})
+
+test("stream ends on a session.status idle event without session.idle", async () => {
+  const events = [
+    {
+      type: "message.part.delta",
+      properties: { sessionID: "sess-123", field: "text", delta: "Hi" },
+    },
+    {
+      type: "session.status",
+      properties: { sessionID: "sess-123", status: { type: "idle" } },
+    },
+  ]
+
+  const handler = createProxyFetchHandler(createStreamingClient(events))
+  const request = new Request("http://127.0.0.1:4010/v1/chat/completions", {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({
+      model: "gpt-4o",
+      stream: true,
+      messages: [{ role: "user", content: "hi" }],
+    }),
+  })
+
+  const response = await handler(request)
+  assert.equal(response.status, 200)
+
+  const text = await response.text()
+  assert.ok(text.includes("Hi"))
+  assert.ok(text.includes("[DONE]"))
+})
+
+test("stream stays open while the session status is busy", async () => {
+  // The quiet-poll must not cut a turn short while OpenCode is still working:
+  // deltas that arrive after a busy period must still be streamed.
+  const client = createSilentStreamClient([
+    {
+      type: "session.status",
+      properties: { sessionID: "sess-123", status: { type: "busy" } },
+    },
+    {
+      type: "message.part.delta",
+      properties: { sessionID: "sess-123", field: "text", delta: "late" },
+    },
+  ])
+  let statusCalls = 0
+  client.session.status = async () => ({
+    data: { "sess-123": { type: statusCalls++ === 0 ? "busy" : "idle" } },
+  })
+
+  const handler = createProxyFetchHandler(client)
+  const request = new Request("http://127.0.0.1:4010/v1/chat/completions", {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({
+      model: "gpt-4o",
+      stream: true,
+      messages: [{ role: "user", content: "hi" }],
+    }),
+  })
+
+  const response = await handler(request)
+  assert.equal(response.status, 200)
+
+  const text = await response.text()
+  assert.ok(text.includes("late"))
+  assert.ok(text.includes("[DONE]"))
+})
+
 test("unknown model returns a safe 400", async () => {
   const handler = createProxyFetchHandler(createClient()) // client returns no providers
   const request = new Request("http://127.0.0.1:4010/v1/chat/completions", {
