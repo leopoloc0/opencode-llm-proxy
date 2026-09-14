@@ -659,6 +659,93 @@ test("stream pseudo-streams polled text when no delta events arrive", async () =
   assert.ok(text.includes("[DONE]"))
 })
 
+test("stream pseudo-streams reasoning content when no delta events arrive", async () => {
+  // Reasoning models can think for minutes without producing text. The
+  // quiet-poll streams the reasoning suffix so the client sees progress (and
+  // a timeout yields a partial response instead of an empty one).
+  const client = createSilentStreamClient([])
+  let calls = 0
+  client.session.messages = async () => {
+    calls++
+    if (calls === 1) {
+      return {
+        data: [{ info: { id: "msg-1", role: "assistant" }, parts: [{ type: "reasoning", text: "Let me think" }] }],
+      }
+    }
+    return {
+      data: [
+        {
+          info: {
+            id: "msg-1",
+            role: "assistant",
+            finish: "stop",
+            tokens: { input: 10, output: 5, reasoning: 3, cache: { read: 0, write: 0 } },
+          },
+          parts: [
+            { type: "reasoning", text: "Let me think about it" },
+            { type: "text", text: "Answer" },
+          ],
+        },
+      ],
+    }
+  }
+
+  const handler = createProxyFetchHandler(client)
+  const request = new Request("http://127.0.0.1:4010/v1/chat/completions", {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({
+      model: "gpt-4o",
+      stream: true,
+      messages: [{ role: "user", content: "hi" }],
+    }),
+  })
+
+  const response = await handler(request)
+  assert.equal(response.status, 200)
+
+  const text = await response.text()
+  const reasoningChunks = [...text.matchAll(/"reasoning_content":"([^"]*)"/g)].map((m) => m[1])
+  assert.deepEqual(reasoningChunks, ["Let me think", " about it"])
+  const textChunks = [...text.matchAll(/"content":"([^"]*)"/g)].map((m) => m[1])
+  assert.deepEqual(textChunks, ["Answer"])
+  assert.ok(text.includes("[DONE]"))
+})
+
+test("non-streaming chat completion includes reasoning_content when present", async () => {
+  const client = createClient()
+  client.config.providers = async () => ({
+    data: { providers: [{ id: "openai", models: { "gpt-4o": { id: "gpt-4o", name: "GPT-4o" } } }] },
+  })
+  client.tool = { ids: async () => ({ data: [] }) }
+  client.session = {
+    create: async () => ({ data: { id: "sess-reason" } }),
+    prompt: async () => ({
+      data: {
+        parts: [
+          { type: "reasoning", text: "thinking hard" },
+          { type: "text", text: "The answer" },
+        ],
+        info: { tokens: { input: 10, output: 5, reasoning: 3, cache: { read: 0, write: 0 } }, finish: "stop" },
+      },
+    }),
+  }
+
+  const handler = createProxyFetchHandler(client)
+  const request = new Request("http://127.0.0.1:4010/v1/chat/completions", {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ model: "gpt-4o", messages: [{ role: "user", content: "hi" }] }),
+  })
+
+  const response = await handler(request)
+  const body = await response.json()
+
+  assert.equal(response.status, 200)
+  assert.equal(body.choices[0].message.content, "The answer")
+  assert.equal(body.choices[0].message.reasoning_content, "thinking hard")
+})
+
 test("stream ends on a session.status idle event without session.idle", async () => {
   const events = [
     {

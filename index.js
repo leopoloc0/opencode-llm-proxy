@@ -587,6 +587,15 @@ export function extractAssistantText(parts) {
     .trim()
 }
 
+// Reasoning models (GLM, DeepSeek, ...) keep their thinking in separate
+// reasoning parts. Never trimmed - callers diff by length for streaming.
+export function extractAssistantReasoning(parts) {
+  return parts
+    .filter((part) => part.type === "reasoning" && typeof part.text === "string")
+    .map((part) => part.text)
+    .join("")
+}
+
 function dataUrlSize(url) {
   if (typeof url !== "string" || !url.startsWith("data:")) return 0
   const comma = url.indexOf(",")
@@ -726,11 +735,13 @@ function createChatCompletionResponse(result, model) {
   const tokensOut = result.completion.data.info?.tokens?.output ?? 0
 
   const toolCalls = result.toolCalls ?? []
+  const reasoning = extractAssistantReasoning(result.completion.data.parts ?? [])
   const message =
     toolCalls.length > 0
       ? {
           role: "assistant",
           content: null,
+          ...(reasoning ? { reasoning_content: reasoning } : {}),
           tool_calls: toolCalls.map((call) => ({
             id: call.id,
             type: "function",
@@ -743,6 +754,7 @@ function createChatCompletionResponse(result, model) {
       : {
           role: "assistant",
           content: result.content,
+          ...(reasoning ? { reasoning_content: reasoning } : {}),
         }
 
   return {
@@ -1245,6 +1257,7 @@ async function runAgentTurn(client, model, messages, system, callerTools, onChun
     // Per-message length of text already emitted via poll-diffs, so repeated
     // polls only stream the newly generated suffix.
     const polledProgressByMessage = new Map()
+    const polledReasoningByMessage = new Map()
 
     const pollTurn = async () => {
       let idle = false
@@ -1264,7 +1277,7 @@ async function runAgentTurn(client, model, messages, system, callerTools, onChun
         const result = await client.session.messages({ path: { id: sessionID }, signal: options.signal })
         const entries = result.data ?? []
         const last = entries.filter((entry) => entry.info?.role === "assistant").at(-1)
-        if (!last) return { done: idle, text: "", messageID: undefined, recoveredToolCalls: false }
+        if (!last) return { done: idle, text: "", reasoning: "", messageID: undefined, recoveredToolCalls: false }
 
         // Zero-event environments never deliver message.part.updated either,
         // so bridge tool calls have to be recovered from the messages
@@ -1289,6 +1302,7 @@ async function runAgentTurn(client, model, messages, system, callerTools, onChun
         }
 
         const text = extractAssistantText(last.parts ?? [])
+        const reasoning = extractAssistantReasoning(last.parts ?? [])
         const messageID = last.info?.id
         const recoveredToolCalls = toolCallsByID.size > 0
         // Once bridge tool calls are recovered, this turn is decided by the
@@ -1322,7 +1336,7 @@ async function runAgentTurn(client, model, messages, system, callerTools, onChun
           if (finish) done = !["tool-calls", "tool_calls", "unknown"].includes(finish)
           else done = Boolean(last.info?.time?.completed)
         }
-        return { done, text, messageID, recoveredToolCalls }
+        return { done, text, reasoning, messageID, recoveredToolCalls }
       } catch {
         return { done: idle, text: "", messageID: undefined, recoveredToolCalls: false }
       }
@@ -1352,6 +1366,17 @@ async function runAgentTurn(client, model, messages, system, callerTools, onChun
               polledProgressByMessage.set(poll.messageID, poll.text.length)
               content += delta
               await onChunk?.(delta)
+            }
+          }
+          // Same for reasoning models: without this the stream is silent for
+          // the entire thinking phase (which can be minutes on big contexts),
+          // and a timeout then surfaces as a completely empty response.
+          if (!sawDelta && poll.messageID && poll.reasoning && options.onReasoningChunk) {
+            const emitted = polledReasoningByMessage.get(poll.messageID) ?? 0
+            if (poll.reasoning.length > emitted) {
+              const delta = poll.reasoning.slice(emitted)
+              polledReasoningByMessage.set(poll.messageID, poll.reasoning.length)
+              await options.onReasoningChunk(delta)
             }
           }
           if (poll.done) {
@@ -2109,6 +2134,20 @@ export function createProxyFetchHandler(client) {
 
         const queue = createSseQueue()
         let emitted = false
+
+        // Reasoning models (GLM, DeepSeek, ...) can spend minutes thinking
+        // without producing any text. Streaming their reasoning keeps the
+        // client informed - and keeps idle timeouts from killing the turn.
+        requestOptions.onReasoningChunk = (text) => {
+          const chunk = JSON.stringify({
+            id: completionID,
+            object: "chat.completion.chunk",
+            created: now,
+            model: model.id,
+            choices: [{ index: 0, delta: { reasoning_content: text }, finish_reason: null }],
+          })
+          queue.enqueue(`data: ${chunk}\n\n`)
+        }
 
         async function* generateSse() {
           const runPromise = executeStreamingWithFallback(candidates, (candidate) => executePromptStreaming(
