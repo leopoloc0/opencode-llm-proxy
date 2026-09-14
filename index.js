@@ -1234,16 +1234,22 @@ async function runAgentTurn(client, model, messages, system, callerTools, onChun
     // through the plugin SDK (with some versions no events arrive on the
     // subscription at all), so the event stream alone cannot be trusted to
     // terminate a turn. Drive the iterator manually and, whenever the stream
-    // has been quiet for a moment, poll the session state and stop once the
-    // turn has finished.
+    // has been quiet for a moment, poll the session state - both to stop once
+    // the turn has finished and, when no delta events arrive at all, to
+    // pseudo-stream the in-progress assistant text to the caller.
     const iterator = stream[Symbol.asyncIterator]()
     let pending = iterator.next()
+    let sawDelta = false
+    // Per-message length of text already emitted via poll-diffs, so repeated
+    // polls only stream the newly generated suffix.
+    const polledProgressByMessage = new Map()
 
-    const turnFinished = async () => {
+    const pollTurn = async () => {
+      let idle = false
       try {
         if (typeof client.session?.status === "function") {
           const result = await client.session.status({ signal: options.signal })
-          if (result.data?.[sessionID]?.type === "idle") return true
+          idle = result.data?.[sessionID]?.type === "idle"
           // Any other status (or none) is NOT conclusive: OpenCode >=1.18
           // marks the session busy at the start of every loop iteration but
           // only transitions back to idle on error paths, so a successful
@@ -1255,16 +1261,21 @@ async function runAgentTurn(client, model, messages, system, callerTools, onChun
       try {
         const result = await client.session.messages({ path: { id: sessionID }, signal: options.signal })
         const last = (result.data ?? []).filter((entry) => entry.info?.role === "assistant").at(-1)
-        if (!last) return false
-        if (last.info?.error) return true
-        // Mirrors OpenCode's own loop-exit condition: the turn is done when
-        // the final assistant message has a finish reason that isn't a tool
-        // continuation.
-        const finish = last.info?.finish
-        if (finish) return !["tool-calls", "tool_calls", "unknown"].includes(finish)
-        return Boolean(last.info?.time?.completed)
+        if (!last) return { done: idle, text: "", messageID: undefined }
+        const text = extractAssistantText(last.parts ?? [])
+        const messageID = last.info?.id
+        let done = idle || Boolean(last.info?.error)
+        if (!done) {
+          // Mirrors OpenCode's own loop-exit condition: the turn is done when
+          // the final assistant message has a finish reason that isn't a tool
+          // continuation.
+          const finish = last.info?.finish
+          if (finish) done = !["tool-calls", "tool_calls", "unknown"].includes(finish)
+          else done = Boolean(last.info?.time?.completed)
+        }
+        return { done, text, messageID }
       } catch {
-        return false
+        return { done: idle, text: "", messageID: undefined }
       }
     }
 
@@ -1278,7 +1289,23 @@ async function runAgentTurn(client, model, messages, system, callerTools, onChun
         if (result === null) {
           // No event for a while: the turn may have finished without
           // `session.idle`. Keep waiting unless OpenCode confirms completion.
-          if (await turnFinished()) break
+          const poll = await pollTurn()
+          // When no delta events arrive at all (plugin-driven sessions on
+          // OpenCode >=1.18), the caller would otherwise stare at a silent
+          // stream until the very end. Emit the newly generated suffix of the
+          // in-progress assistant message instead. Disabled the moment a real
+          // delta event arrives, so event-capable OpenCode versions never see
+          // duplicated chunks.
+          if (!sawDelta && poll.messageID && poll.text) {
+            const emitted = polledProgressByMessage.get(poll.messageID) ?? 0
+            if (poll.text.length > emitted) {
+              const delta = poll.text.slice(emitted)
+              polledProgressByMessage.set(poll.messageID, poll.text.length)
+              content += delta
+              await onChunk?.(delta)
+            }
+          }
+          if (poll.done) break
           continue
         }
         if (result.done) break
@@ -1298,6 +1325,7 @@ async function runAgentTurn(client, model, messages, system, callerTools, onChun
             typeof props.delta === "string" &&
             props.delta.length > 0
           ) {
+            sawDelta = true
             content += props.delta
             await onChunk?.(props.delta)
           }

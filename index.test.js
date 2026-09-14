@@ -614,6 +614,51 @@ test("stream completes when no events arrive at all", async () => {
   assert.ok(text.includes("[DONE]"))
 })
 
+test("stream pseudo-streams polled text when no delta events arrive", async () => {
+  // Zero-event environment: progress must still reach the caller
+  // incrementally, diffed from the in-progress assistant message that the
+  // quiet-poll already fetches.
+  const client = createSilentStreamClient([])
+  const baseMessages = client.session.messages
+  let calls = 0
+  client.session.messages = async (...args) => {
+    calls++
+    if (calls === 1) {
+      return { data: [{ info: { id: "msg-1", role: "assistant" }, parts: [{ type: "text", text: "Hel" }] }] }
+    }
+    if (calls === 2) {
+      return { data: [{ info: { id: "msg-1", role: "assistant" }, parts: [{ type: "text", text: "Hello" }] }] }
+    }
+    return {
+      data: [
+        {
+          info: { id: "msg-1", role: "assistant", finish: "stop", tokens: { input: 10, output: 5, reasoning: 0, cache: { read: 0, write: 0 } } },
+          parts: [{ type: "text", text: "Hello" }],
+        },
+      ],
+    }
+  }
+
+  const handler = createProxyFetchHandler(client)
+  const request = new Request("http://127.0.0.1:4010/v1/chat/completions", {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({
+      model: "gpt-4o",
+      stream: true,
+      messages: [{ role: "user", content: "hi" }],
+    }),
+  })
+
+  const response = await handler(request)
+  assert.equal(response.status, 200)
+
+  const text = await response.text()
+  const contents = [...text.matchAll(/"content":"([^"]*)"/g)].map((m) => m[1])
+  assert.deepEqual(contents, ["Hel", "lo"])
+  assert.ok(text.includes("[DONE]"))
+})
+
 test("stream ends on a session.status idle event without session.idle", async () => {
   const events = [
     {
