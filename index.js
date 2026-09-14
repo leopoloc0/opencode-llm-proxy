@@ -2809,6 +2809,20 @@ export const OpenAIProxyPlugin = async ({ client }) => {
 
   const hostname = process.env.OPENCODE_LLM_PROXY_HOST ?? "127.0.0.1"
   const port = Number.parseInt(process.env.OPENCODE_LLM_PROXY_PORT ?? "4010", 10)
+  // Bun's default idleTimeout is 10s, which is far too short for LLM completions -
+  // even simple ones routinely take longer, and long or tool-calling turns can take
+  // well over a minute. This is especially fatal when OpenCode does not emit
+  // incremental events for a session (see runAgentTurn): the SSE stream then stays
+  // silent from response.created until the turn completes, and Bun aborts the
+  // in-flight request mid-stream ("[Bun.serve]: request timed out after 10
+  // seconds"), silently truncating the response before response.completed / [DONE]
+  // is ever sent. Callers can still override it (e.g. to something shorter) via
+  // OPENCODE_LLM_PROXY_IDLE_TIMEOUT. 255 is Bun's current maximum for this option
+  // (it's stored as a uint8 internally).
+  const idleTimeout = Math.min(
+    255,
+    Math.max(10, Number.parseInt(process.env.OPENCODE_LLM_PROXY_IDLE_TIMEOUT ?? "255", 10) || 255),
+  )
   let config
   try {
     config = loadConfig()
@@ -2830,6 +2844,7 @@ export const OpenAIProxyPlugin = async ({ client }) => {
     server = Bun.serve({
       hostname,
       port,
+      idleTimeout,
       fetch: createProxyFetchHandler(client),
     })
   } catch (error) {
@@ -2848,6 +2863,7 @@ export const OpenAIProxyPlugin = async ({ client }) => {
   await safeLog(client, "info", "OpenAI proxy server started", {
     hostname,
     port,
+    idleTimeout,
     protected: Boolean(process.env.OPENCODE_LLM_PROXY_TOKEN),
   })
 
