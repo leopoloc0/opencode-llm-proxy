@@ -2750,6 +2750,102 @@ test("POST /v1/chat/completions stream: true emits tool_calls delta and finish_r
   assert.ok(text.includes('"finish_reason":"tool_calls"'))
 })
 
+test("stream recovers tool calls from polled messages when no events arrive", async () => {
+  // Zero-event environment: message.part.updated never fires, so the bridge
+  // tool call can only be recovered from session.messages(). The turn must
+  // complete with the caller's tool_calls (and abort the session so OpenCode
+  // does not continue on the placeholder bridge result).
+  let capturedSlotName = null
+  let aborts = 0
+  const client = {
+    app: { log: async () => {} },
+    tool: { ids: async () => ({ data: [] }) },
+    config: {
+      providers: async () => ({
+        data: { providers: [{ id: "openai", models: { "gpt-4o": { id: "gpt-4o", name: "GPT-4o" } } }] },
+      }),
+    },
+    mcp: {
+      disconnect: async () => {
+        throw new Error("not connected")
+      },
+      add: async ({ body }) => {
+        capturedSlotName = body.name
+        return { data: {} }
+      },
+    },
+    session: {
+      create: async () => ({ data: { id: "sess-tool-silent" } }),
+      promptAsync: async () => {},
+      abort: async () => {
+        aborts++
+        return { data: true }
+      },
+      messages: async () => ({
+        data: [
+          {
+            info: {
+              id: "msg-tool-1",
+              role: "assistant",
+              finish: "tool-calls",
+              tokens: { input: 5, output: 2, reasoning: 0, cache: { read: 0, write: 0 } },
+            },
+            parts: [
+              {
+                type: "tool",
+                sessionID: "sess-tool-silent",
+                messageID: "msg-tool-1",
+                tool: `${capturedSlotName}_get_weather`,
+                callID: "call_1",
+                state: { status: "completed", input: { city: "NYC" } },
+              },
+            ],
+          },
+        ],
+      }),
+    },
+    event: {
+      subscribe: async () => ({
+        stream: {
+          [Symbol.asyncIterator]() {
+            return this
+          },
+          async next() {
+            return new Promise(() => {}) // never settles: no events at all
+          },
+          async return() {
+            return { done: true, value: undefined }
+          },
+        },
+      }),
+    },
+  }
+
+  const handler = createProxyFetchHandler(client)
+  const request = new Request("http://127.0.0.1:4010/v1/chat/completions", {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({
+      model: "gpt-4o",
+      stream: true,
+      messages: [{ role: "user", content: "What's the weather in NYC?" }],
+      tools: [{ type: "function", function: { name: "get_weather" } }],
+    }),
+  })
+
+  const response = await handler(request)
+  assert.equal(response.status, 200)
+
+  const text = await response.text()
+  assert.ok(text.includes('"tool_calls"'), "expected a tool_calls chunk")
+  assert.ok(text.includes("get_weather"))
+  assert.ok(text.includes("call_1"))
+  assert.ok(text.includes("NYC"))
+  assert.ok(text.includes('"finish_reason":"tool_calls"'))
+  assert.ok(text.includes("[DONE]"))
+  assert.ok(aborts > 0, "expected the session to be aborted after recovering the tool call")
+})
+
 test("POST /v1/messages returns tool_use content block when the model calls a tool", async () => {
   const client = createToolCallClient({ toolName: "get_weather", toolArgs: { city: "NYC" }, callID: "toolu_1" })
   const handler = createProxyFetchHandler(client)

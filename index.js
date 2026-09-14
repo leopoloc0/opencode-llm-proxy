@@ -1260,12 +1260,45 @@ async function runAgentTurn(client, model, messages, system, callerTools, onChun
       }
       try {
         const result = await client.session.messages({ path: { id: sessionID }, signal: options.signal })
-        const last = (result.data ?? []).filter((entry) => entry.info?.role === "assistant").at(-1)
-        if (!last) return { done: idle, text: "", messageID: undefined }
+        const entries = result.data ?? []
+        const last = entries.filter((entry) => entry.info?.role === "assistant").at(-1)
+        if (!last) return { done: idle, text: "", messageID: undefined, recoveredToolCalls: false }
+
+        // Zero-event environments never deliver message.part.updated either,
+        // so bridge tool calls have to be recovered from the messages
+        // themselves. Only when the live stream captured nothing - otherwise
+        // it remains the authoritative source for tool parts.
+        if (toolIDSet && toolCallsByID.size === 0) {
+          for (const entry of entries) {
+            if (entry.info?.role !== "assistant") continue
+            if (toolMessageID && entry.info?.id && entry.info.id !== toolMessageID) continue
+            for (const part of entry.parts ?? []) {
+              if (part?.type !== "tool" || !toolIDSet.has(part.tool)) continue
+              const input = part.state?.input
+              const hasInput =
+                input && typeof input === "object" && !Array.isArray(input) && Object.keys(input).length > 0
+              // "pending" parts carry no input yet; only record once the call
+              // is real (input populated, or the bridge already ran).
+              if (!hasInput && part.state?.status !== "running" && part.state?.status !== "completed") continue
+              if (!toolMessageID) toolMessageID = part.messageID ?? entry.info?.id ?? null
+              recordToolPart(part)
+            }
+          }
+        }
+
         const text = extractAssistantText(last.parts ?? [])
         const messageID = last.info?.id
+        const recoveredToolCalls = toolCallsByID.size > 0
+        const messageComplete =
+          Boolean(last.info?.finish) || Boolean(last.info?.time?.completed) || Boolean(last.info?.error)
         let done = idle || Boolean(last.info?.error)
-        if (!done) {
+        if (!done && recoveredToolCalls && messageComplete) {
+          // The tool-calling step is finished but no step-finish event ever
+          // arrives to say so. End the turn with the recovered calls; the
+          // caller aborts the session so OpenCode does not run a follow-up
+          // step on the placeholder bridge results.
+          done = true
+        } else if (!done) {
           // Mirrors OpenCode's own loop-exit condition: the turn is done when
           // the final assistant message has a finish reason that isn't a tool
           // continuation.
@@ -1273,9 +1306,9 @@ async function runAgentTurn(client, model, messages, system, callerTools, onChun
           if (finish) done = !["tool-calls", "tool_calls", "unknown"].includes(finish)
           else done = Boolean(last.info?.time?.completed)
         }
-        return { done, text, messageID }
+        return { done, text, messageID, recoveredToolCalls }
       } catch {
-        return { done: idle, text: "", messageID: undefined }
+        return { done: idle, text: "", messageID: undefined, recoveredToolCalls: false }
       }
     }
 
@@ -1305,7 +1338,19 @@ async function runAgentTurn(client, model, messages, system, callerTools, onChun
               await onChunk?.(delta)
             }
           }
-          if (poll.done) break
+          if (poll.done) {
+            if (poll.recoveredToolCalls) {
+              // No step-finish event fired, so the session was never aborted:
+              // stop OpenCode before it runs a follow-up step on the
+              // placeholder bridge results.
+              try {
+                await client.session.abort({ path: { id: sessionID } })
+              } catch {
+                // Best effort - the turn is over for us regardless.
+              }
+            }
+            break
+          }
           continue
         }
         if (result.done) break
