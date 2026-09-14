@@ -677,6 +677,40 @@ test("stream completes even if the session status reports busy after the turn", 
   assert.ok(text.includes("[DONE]"))
 })
 
+test("stream response is not delayed by a slow event-stream disposal", async () => {
+  // OpenCode's event subscription iterator can be suspended in a read that
+  // only settles on the next event/heartbeat, so stream.return() may take
+  // seconds. The response must complete without waiting for it.
+  const client = createStreamingClient([{ type: "session.idle", properties: { sessionID: "sess-123" } }])
+  client.event.subscribe = async () => {
+    async function* gen() {
+      yield { type: "session.idle", properties: { sessionID: "sess-123" } }
+    }
+    const stream = gen()
+    stream.return = () => new Promise(() => {}) // never settles
+    return { stream }
+  }
+
+  const handler = createProxyFetchHandler(client)
+  const request = new Request("http://127.0.0.1:4010/v1/chat/completions", {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({
+      model: "gpt-4o",
+      stream: true,
+      messages: [{ role: "user", content: "hi" }],
+    }),
+  })
+
+  const started = Date.now()
+  const response = await handler(request)
+  assert.equal(response.status, 200)
+
+  const text = await response.text()
+  assert.ok(text.includes("[DONE]"))
+  assert.ok(Date.now() - started < 5000, "response must not wait on stream disposal")
+})
+
 test("stream stays open while the last assistant message is unfinished", async () => {
   // The quiet-poll must not cut a turn short while OpenCode is still working:
   // completion is only signalled once the final assistant message has a

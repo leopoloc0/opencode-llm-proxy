@@ -37,6 +37,11 @@ const DEFAULTS = Object.freeze({
 // the client times out.
 const STREAM_QUIET_POLL_MS = 500
 
+// Max time to wait for the event-subscription iterator to dispose. The
+// iterator can be suspended in a read that only settles on the next event or
+// heartbeat from OpenCode's event bridge, so disposal is best-effort.
+const STREAM_DISPOSAL_GRACE_MS = 250
+
 class ProxyError extends Error {
   constructor(message, status = 500, code = "server_error") {
     super(message)
@@ -1355,7 +1360,20 @@ async function runAgentTurn(client, model, messages, system, callerTools, onChun
   } finally {
     removeAbortListener()
     try {
-      await eventStream?.return?.()
+      const disposal = eventStream?.return?.()
+      if (disposal) {
+        // The subscription iterator may be suspended in a read that only
+        // settles on the next event or heartbeat (observed: up to ~10s with
+        // OpenCode's event bridge when no events are flowing for the
+        // session). Never block the response on disposal.
+        await Promise.race([
+          disposal.catch(() => {}),
+          new Promise((resolve) => {
+            const timer = setTimeout(resolve, STREAM_DISPOSAL_GRACE_MS)
+            timer.unref?.()
+          }),
+        ])
+      }
     } catch {
       // Signal and session cleanup remain authoritative if iterator disposal fails.
     }
