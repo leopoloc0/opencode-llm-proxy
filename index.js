@@ -1238,9 +1238,11 @@ async function runAgentTurn(client, model, messages, system, callerTools, onChun
       try {
         if (typeof client.session?.status === "function") {
           const result = await client.session.status({ signal: options.signal })
-          const status = result.data?.[sessionID]
-          if (status) return status.type === "idle"
-          // Session not tracked as busy: confirm via the messages below.
+          if (result.data?.[sessionID]?.type === "idle") return true
+          // Any other status (or none) is NOT conclusive: OpenCode >=1.18
+          // marks the session busy at the start of every loop iteration but
+          // only transitions back to idle on error paths, so a successful
+          // turn reports busy forever. Confirm via the message state below.
         }
       } catch {
         // Fall through to the message-based check.
@@ -1248,8 +1250,14 @@ async function runAgentTurn(client, model, messages, system, callerTools, onChun
       try {
         const result = await client.session.messages({ path: { id: sessionID }, signal: options.signal })
         const last = (result.data ?? []).filter((entry) => entry.info?.role === "assistant").at(-1)
-        const finish = last?.info?.finish
-        return Boolean(last?.info?.error || (finish && finish !== "tool-calls" && finish !== "tool_calls"))
+        if (!last) return false
+        if (last.info?.error) return true
+        // Mirrors OpenCode's own loop-exit condition: the turn is done when
+        // the final assistant message has a finish reason that isn't a tool
+        // continuation.
+        const finish = last.info?.finish
+        if (finish) return !["tool-calls", "tool_calls", "unknown"].includes(finish)
+        return Boolean(last.info?.time?.completed)
       } catch {
         return false
       }

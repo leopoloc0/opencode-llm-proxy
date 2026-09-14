@@ -645,9 +645,42 @@ test("stream ends on a session.status idle event without session.idle", async ()
   assert.ok(text.includes("[DONE]"))
 })
 
-test("stream stays open while the session status is busy", async () => {
+test("stream completes even if the session status reports busy after the turn", async () => {
+  // Reproduces OpenCode >=1.18: prompt.ts marks the session busy at the start
+  // of every loop iteration but never transitions back to idle on the success
+  // path, so session.status() reports busy forever after a completed turn.
+  // Completion must be detected from the finished assistant message instead.
+  const client = createSilentStreamClient([
+    {
+      type: "message.part.delta",
+      properties: { sessionID: "sess-123", field: "text", delta: "Done" },
+    },
+  ])
+  client.session.status = async () => ({ data: { "sess-123": { type: "busy" } } })
+
+  const handler = createProxyFetchHandler(client)
+  const request = new Request("http://127.0.0.1:4010/v1/chat/completions", {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({
+      model: "gpt-4o",
+      stream: true,
+      messages: [{ role: "user", content: "hi" }],
+    }),
+  })
+
+  const response = await handler(request)
+  assert.equal(response.status, 200)
+
+  const text = await response.text()
+  assert.ok(text.includes("Done"))
+  assert.ok(text.includes("[DONE]"))
+})
+
+test("stream stays open while the last assistant message is unfinished", async () => {
   // The quiet-poll must not cut a turn short while OpenCode is still working:
-  // deltas that arrive after a busy period must still be streamed.
+  // completion is only signalled once the final assistant message has a
+  // finish reason (or an error). Deltas that arrive before that must stream.
   const client = createSilentStreamClient([
     {
       type: "session.status",
@@ -658,10 +691,17 @@ test("stream stays open while the session status is busy", async () => {
       properties: { sessionID: "sess-123", field: "text", delta: "late" },
     },
   ])
-  let statusCalls = 0
-  client.session.status = async () => ({
-    data: { "sess-123": { type: statusCalls++ === 0 ? "busy" : "idle" } },
-  })
+  client.session.status = async () => ({ data: { "sess-123": { type: "busy" } } })
+  const baseMessages = client.session.messages
+  let polls = 0
+  client.session.messages = async (...args) => {
+    polls++
+    if (polls === 1) {
+      // Turn still running: assistant message exists but has no finish yet.
+      return { data: [{ info: { role: "assistant", tokens: { input: 1, output: 1 } }, parts: [] }] }
+    }
+    return baseMessages(...args)
+  }
 
   const handler = createProxyFetchHandler(client)
   const request = new Request("http://127.0.0.1:4010/v1/chat/completions", {
@@ -680,6 +720,7 @@ test("stream stays open while the session status is busy", async () => {
   const text = await response.text()
   assert.ok(text.includes("late"))
   assert.ok(text.includes("[DONE]"))
+  assert.ok(polls >= 2, "expected the turn to keep polling while unfinished")
 })
 
 test("unknown model returns a safe 400", async () => {
