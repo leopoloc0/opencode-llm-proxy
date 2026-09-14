@@ -2750,6 +2750,102 @@ test("POST /v1/chat/completions stream: true emits tool_calls delta and finish_r
   assert.ok(text.includes('"finish_reason":"tool_calls"'))
 })
 
+test("stream ends a tool-calling turn even when a follow-up message is already in progress", async () => {
+  // Regression: the poll used to judge completion by the LATEST assistant
+  // message only. OpenCode runs the placeholder bridge result into a
+  // follow-up step immediately, so by the time the poll fired, the latest
+  // message was the unfinished follow-up - and the turn waited out whole
+  // wasted LLM steps. Completion must be judged by the tool-calling message.
+  let capturedSlotName = null
+  const client = {
+    app: { log: async () => {} },
+    tool: { ids: async () => ({ data: [] }) },
+    config: {
+      providers: async () => ({
+        data: { providers: [{ id: "openai", models: { "gpt-4o": { id: "gpt-4o", name: "GPT-4o" } } }] },
+      }),
+    },
+    mcp: {
+      disconnect: async () => {
+        throw new Error("not connected")
+      },
+      add: async ({ body }) => {
+        capturedSlotName = body.name
+        return { data: {} }
+      },
+    },
+    session: {
+      create: async () => ({ data: { id: "sess-tool-race" } }),
+      promptAsync: async () => {},
+      abort: async () => ({ data: true }),
+      messages: async () => ({
+        data: [
+          {
+            info: {
+              id: "msg-tool-1",
+              role: "assistant",
+              finish: "tool-calls",
+              tokens: { input: 5, output: 2, reasoning: 0, cache: { read: 0, write: 0 } },
+            },
+            parts: [
+              {
+                type: "tool",
+                sessionID: "sess-tool-race",
+                messageID: "msg-tool-1",
+                tool: `${capturedSlotName}_get_weather`,
+                callID: "call_1",
+                state: { status: "completed", input: { city: "NYC" } },
+              },
+            ],
+          },
+          {
+            // The follow-up step OpenCode started on the placeholder result -
+            // still generating, no finish reason yet.
+            info: { id: "msg-followup", role: "assistant" },
+            parts: [{ type: "text", text: "The weather in NYC is" }],
+          },
+        ],
+      }),
+    },
+    event: {
+      subscribe: async () => ({
+        stream: {
+          [Symbol.asyncIterator]() {
+            return this
+          },
+          async next() {
+            return new Promise(() => {}) // never settles: no events at all
+          },
+          async return() {
+            return { done: true, value: undefined }
+          },
+        },
+      }),
+    },
+  }
+
+  const handler = createProxyFetchHandler(client)
+  const request = new Request("http://127.0.0.1:4010/v1/chat/completions", {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({
+      model: "gpt-4o",
+      stream: true,
+      messages: [{ role: "user", content: "What's the weather in NYC?" }],
+      tools: [{ type: "function", function: { name: "get_weather" } }],
+    }),
+  })
+
+  const response = await handler(request)
+  assert.equal(response.status, 200)
+
+  const text = await response.text()
+  assert.ok(text.includes('"tool_calls"'), "expected a tool_calls chunk")
+  assert.ok(text.includes("get_weather"))
+  assert.ok(text.includes('"finish_reason":"tool_calls"'))
+  assert.ok(text.includes("[DONE]"))
+})
+
 test("stream recovers tool calls from polled messages when no events arrive", async () => {
   // Zero-event environment: message.part.updated never fires, so the bridge
   // tool call can only be recovered from session.messages(). The turn must

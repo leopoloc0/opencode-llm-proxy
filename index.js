@@ -34,8 +34,10 @@ const DEFAULTS = Object.freeze({
 // the session state directly. Only relevant when OpenCode never emits
 // `session.idle` (observed for sessions driven through the plugin SDK), where
 // the subscription otherwise stays open forever and the request hangs until
-// the client times out.
-const STREAM_QUIET_POLL_MS = 500
+// the client times out. Kept short because in zero-event environments this
+// poll is also what ends tool-calling turns before OpenCode runs a follow-up
+// step on the placeholder bridge results.
+const STREAM_QUIET_POLL_MS = 250
 
 // Max time to wait for the event-subscription iterator to dispose. The
 // iterator can be suspended in a read that only settles on the next event or
@@ -1289,10 +1291,24 @@ async function runAgentTurn(client, model, messages, system, callerTools, onChun
         const text = extractAssistantText(last.parts ?? [])
         const messageID = last.info?.id
         const recoveredToolCalls = toolCallsByID.size > 0
+        // Once bridge tool calls are recovered, this turn is decided by the
+        // tool-CALLING message itself - not by whatever follow-up message
+        // OpenCode is already generating from the placeholder bridge result.
+        // Waiting for the follow-up loses the race and wastes whole LLM
+        // steps while the model reacts to the placeholder.
+        let toolSourceDone = false
+        if (recoveredToolCalls && toolMessageID) {
+          const source =
+            entries.find((entry) => entry.info?.id === toolMessageID) ??
+            entries.find((entry) => (entry.parts ?? []).some((p) => p.messageID === toolMessageID))
+          const src = source ?? last
+          toolSourceDone =
+            Boolean(src.info?.finish) || Boolean(src.info?.time?.completed) || Boolean(src.info?.error)
+        }
         const messageComplete =
           Boolean(last.info?.finish) || Boolean(last.info?.time?.completed) || Boolean(last.info?.error)
         let done = idle || Boolean(last.info?.error)
-        if (!done && recoveredToolCalls && messageComplete) {
+        if (!done && recoveredToolCalls && (toolSourceDone || messageComplete)) {
           // The tool-calling step is finished but no step-finish event ever
           // arrives to say so. End the turn with the recovered calls; the
           // caller aborts the session so OpenCode does not run a follow-up
